@@ -1,54 +1,41 @@
 import os
-
-os.environ["KERAS_BACKEND"] = "tensorflow"
-
-import keras
-from keras import layers
-
-import gymnasium as gym
-from gymnasium.wrappers import AtariPreprocessing, FrameStackObservation
+import json
 import numpy as np
 import tensorflow as tf
+import keras
+from keras import layers
+import gymnasium as gym
+from gymnasium.wrappers import AtariPreprocessing, FrameStackObservation
+import matplotlib.pyplot as plt
 import ale_py
 
-# Configuration parameters for the whole setup
-seed = 42
-gamma = 0.99  # Discount factor for past rewards
-epsilon = 1.0  # Epsilon greedy parameter
-epsilon_min = 0.1  # Minimum epsilon greedy parameter
-epsilon_max = 1.0  # Maximum epsilon greedy parameter
-epsilon_interval = (
-    epsilon_max - epsilon_min
-)  # Rate at which to reduce chance of random action being taken
-batch_size = 32  # Size of batch taken from replay buffer
-max_steps_per_episode = 10000
-max_episodes = 10  # Limit training episodes, will run until solved if smaller than 1
 
-gym.register_envs(ale_py)
-# Use the Atari environment
-# Specify the `render_mode` parameter to show the attempts of the agent in a pop up window.
-env = gym.make("ALE/Breakout-v5", frameskip=1)  # , render_mode="human")
-# Environment preprocessing
-env = AtariPreprocessing(env)
-# Stack four frames
-env = FrameStackObservation(env, 4)
-
-obs, info = env.reset(seed=42)
-
-num_actions = 4
+# Configuration parameters
+class Config:
+    SEED = 42
+    GAMMA = 0.99  # Discount factor
+    EPSILON_START = 1.0
+    EPSILON_MIN = 0.1
+    EPSILON_DECAY = 0.9995
+    BATCH_SIZE = 64
+    MAX_STEPS_PER_EPISODE = 10000
+    MAX_EPISODES = 500
+    LEARNING_RATE = 0.00025
+    UPDATE_TARGET_NETWORK = 10000
+    MAX_MEMORY_LENGTH = 100000
+    METRICS_FILE = "training_metrics.json"
+    PLOT_FILE = "training_performance.png"
 
 
-def create_q_model():
-    # Network defined by the Deepmind paper
+def create_q_model(input_shape=(4, 84, 84), num_actions=4):
     return keras.Sequential(
         [
             layers.Lambda(
                 lambda tensor: keras.ops.transpose(tensor, [0, 2, 3, 1]),
                 output_shape=(84, 84, 4),
-                input_shape=(4, 84, 84),
+                input_shape=input_shape,
             ),
-            # Convolutions on the frames on the screen
-            layers.Conv2D(32, 8, strides=4, activation="relu", input_shape=(4, 84, 84)),
+            layers.Conv2D(32, 8, strides=4, activation="relu"),
             layers.Conv2D(64, 4, strides=2, activation="relu"),
             layers.Conv2D(64, 3, strides=1, activation="relu"),
             layers.Flatten(),
@@ -58,154 +45,237 @@ def create_q_model():
     )
 
 
-# The first model makes the predictions for Q-values which are used to
-# make a action.
-model = create_q_model()
-# Build a target model for the prediction of future rewards.
-# The weights of a target model get updated every 10000 steps thus when the
-# loss between the Q-values is calculated the target Q-value is stable.
-model_target = create_q_model()
+class DQNAgent:
+    def __init__(self, num_actions, input_shape=(4, 84, 84)):
+        self.num_actions = num_actions
+        self.model = create_q_model(input_shape, num_actions)
+        self.target_model = create_q_model(input_shape, num_actions)
 
-# In the Deepmind paper they use RMSProp however then Adam optimizer
-# improves training time
-optimizer = keras.optimizers.Adam(learning_rate=0.00025, clipnorm=1.0)
+        self.optimizer = keras.optimizers.Adam(
+            learning_rate=Config.LEARNING_RATE, clipnorm=1.0
+        )
+        self.loss_function = keras.losses.Huber()
 
-# Experience replay buffers
-action_history = []
-state_history = []
-state_next_history = []
-rewards_history = []
-done_history = []
-episode_reward_history = []
-running_reward = 0
-episode_count = 0
-frame_count = 0
-# Number of frames to take random action and observe output
-epsilon_random_frames = 50000
-# Number of frames for exploration
-epsilon_greedy_frames = 1000000.0
-# Maximum replay length
-# Note: The Deepmind paper suggests 1000000 however this causes memory issues
-max_memory_length = 100000
-# Train the model after 4 actions
-update_after_actions = 4
-# How often to update the target network
-update_target_network = 10000
-# Using huber loss for stability
-loss_function = keras.losses.Huber()
+        # Replay buffers
+        self.state_history = []
+        self.action_history = []
+        self.next_state_history = []
+        self.reward_history = []
+        self.done_history = []
 
-while True:
-    observation, _ = env.reset()
-    state = np.array(observation)
-    episode_reward = 0
+        # Metrics tracking
+        self.training_metrics = []
 
-    for timestep in range(1, max_steps_per_episode):
-        frame_count += 1
+    def choose_action(self, state, epsilon):
+        if np.random.random() < epsilon:
+            return np.random.choice(self.num_actions)
 
-        # Use epsilon-greedy for exploration
-        if frame_count < epsilon_random_frames or epsilon > np.random.rand(1)[0]:
-            # Take random action
-            action = np.random.choice(num_actions)
-        else:
-            # Predict action Q-values
-            # From environment state
-            state_tensor = keras.ops.convert_to_tensor(state)
-            state_tensor = keras.ops.expand_dims(state_tensor, 0)
-            action_probs = model(state_tensor, training=False)
-            # Take best action
-            action = keras.ops.argmax(action_probs[0]).numpy()
+        state_tensor = keras.ops.convert_to_tensor(state)
+        state_tensor = keras.ops.expand_dims(state_tensor, 0)
+        action_probs = self.model(state_tensor, training=False)
+        return keras.ops.argmax(action_probs[0]).numpy()
 
-        # Decay probability of taking random action
-        epsilon -= epsilon_interval / epsilon_greedy_frames
-        epsilon = max(epsilon, epsilon_min)
+    def store_transition(self, state, action, next_state, reward, done):
+        self.state_history.append(state)
+        self.action_history.append(action)
+        self.next_state_history.append(next_state)
+        self.reward_history.append(reward)
+        self.done_history.append(done)
 
-        # Apply the sampled action in our environment
-        state_next, reward, done, _, _ = env.step(action)
-        state_next = np.array(state_next)
+        # Limit memory
+        if len(self.state_history) > Config.MAX_MEMORY_LENGTH:
+            for history in [
+                self.state_history,
+                self.action_history,
+                self.next_state_history,
+                self.reward_history,
+                self.done_history,
+            ]:
+                del history[0]
 
-        episode_reward += reward
+    def train(self, frame_count):
+        if len(self.done_history) < Config.BATCH_SIZE:
+            return None
 
-        # Save actions and states in replay buffer
-        action_history.append(action)
-        state_history.append(state)
-        state_next_history.append(state_next)
-        done_history.append(done)
-        rewards_history.append(reward)
-        state = state_next
+        # Sample batch from replay buffer
+        indices = np.random.choice(
+            range(len(self.done_history)), size=Config.BATCH_SIZE
+        )
 
-        # Update every fourth frame and once batch size is over 32
-        if frame_count % update_after_actions == 0 and len(done_history) > batch_size:
-            # Get indices of samples for replay buffers
-            indices = np.random.choice(range(len(done_history)), size=batch_size)
+        state_batch = np.array([self.state_history[i] for i in indices])
+        next_state_batch = np.array([self.next_state_history[i] for i in indices])
+        reward_batch = [self.reward_history[i] for i in indices]
+        action_batch = [self.action_history[i] for i in indices]
+        done_batch = keras.ops.convert_to_tensor(
+            [float(self.done_history[i]) for i in indices]
+        )
 
-            # Using list comprehension to sample from replay buffer
-            state_sample = np.array([state_history[i] for i in indices])
-            state_next_sample = np.array([state_next_history[i] for i in indices])
-            rewards_sample = [rewards_history[i] for i in indices]
-            action_sample = [action_history[i] for i in indices]
-            done_sample = keras.ops.convert_to_tensor(
-                [float(done_history[i]) for i in indices]
+        # Compute target Q-values
+        future_rewards = self.target_model.predict(next_state_batch)
+        updated_q_values = reward_batch + Config.GAMMA * (
+            keras.ops.amax(future_rewards, axis=1)
+        ) * (1 - done_batch)
+
+        # Create action masks
+        masks = keras.ops.one_hot(action_batch, self.num_actions)
+
+        with tf.GradientTape() as tape:
+            q_values = self.model(state_batch)
+            q_action = keras.ops.sum(keras.ops.multiply(q_values, masks), axis=1)
+            loss = self.loss_function(updated_q_values, q_action)
+
+        # Backpropagate
+        grads = tape.gradient(loss, self.model.trainable_variables)
+        self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+
+        return loss.numpy()
+
+    def update_target_network(self):
+        self.target_model.set_weights(self.model.get_weights())
+
+    def log_metrics(self, episode, episode_reward, running_reward, epsilon, loss):
+        metrics = {
+            "episode": episode,
+            "episodeReward": episode_reward,
+            "runningReward": running_reward,
+            "epsilon": epsilon,
+            "loss": float(loss) if loss is not None else None,
+        }
+        self.training_metrics.append(metrics)
+
+    def save_metrics(self):
+        with open(Config.METRICS_FILE, "w") as f:
+            json.dump(self.training_metrics, f)
+
+        # Plot training progress
+        plt.figure(figsize=(12, 8))
+
+        plt.subplot(2, 2, 1)
+        plt.plot(
+            [m["episode"] for m in self.training_metrics],
+            [m["episodeReward"] for m in self.training_metrics],
+        )
+        plt.title("Episode Rewards")
+        plt.xlabel("Episode")
+        plt.ylabel("Reward")
+
+        plt.subplot(2, 2, 2)
+        plt.plot(
+            [m["episode"] for m in self.training_metrics],
+            [m["runningReward"] for m in self.training_metrics],
+        )
+        plt.title("Running Rewards")
+        plt.xlabel("Episode")
+        plt.ylabel("Reward")
+
+        plt.subplot(2, 2, 3)
+        plt.plot(
+            [m["episode"] for m in self.training_metrics],
+            [m["epsilon"] for m in self.training_metrics],
+        )
+        plt.title("Exploration Rate")
+        plt.xlabel("Episode")
+        plt.ylabel("Epsilon")
+
+        plt.subplot(2, 2, 4)
+        losses = [m["loss"] for m in self.training_metrics if m["loss"] is not None]
+        plt.plot(range(len(losses)), losses)
+        plt.title("Training Loss")
+        plt.xlabel("Training Steps")
+        plt.ylabel("Loss")
+
+        plt.tight_layout()
+        plt.savefig(Config.PLOT_FILE)
+        plt.close()
+
+
+def train_dqn():
+    # Set random seeds
+    np.random.seed(Config.SEED)
+    tf.random.set_seed(Config.SEED)
+
+    gym.register_envs(ale_py)
+    # Environment setup
+    env = gym.make("ALE/Breakout-v5", frameskip=1)
+    env = AtariPreprocessing(env)
+    env = FrameStackObservation(env, 4)
+
+    # Agent and environment initialization
+    num_actions = env.action_space.n
+    agent = DQNAgent(num_actions)
+
+    # Training loop
+    frame_count = 0
+    episode_count = 0
+    running_reward = 0
+    episode_reward_history = []
+    epsilon = Config.EPSILON_START
+
+    while episode_count < Config.MAX_EPISODES:
+        state, _ = env.reset()
+        state = np.array(state)
+        episode_reward = 0
+
+        for step in range(1, Config.MAX_STEPS_PER_EPISODE):
+            frame_count += 1
+
+            # Choose action
+            action = agent.choose_action(state, epsilon)
+
+            # Step environment
+            next_state, reward, done, _, _ = env.step(action)
+            next_state = np.array(next_state)
+
+            # Store transition
+            agent.store_transition(state, action, next_state, reward, done)
+
+            # Train
+            loss = agent.train(frame_count)
+
+            # Decay epsilon
+            epsilon = max(Config.EPSILON_MIN, epsilon * Config.EPSILON_DECAY)
+
+            episode_reward += reward
+            state = next_state
+
+            # Update target network periodically
+            if frame_count % Config.UPDATE_TARGET_NETWORK == 0:
+                agent.update_target_network()
+
+            if done:
+                break
+
+        # Track episode rewards
+        episode_reward_history.append(episode_reward)
+        if len(episode_reward_history) > 100:
+            episode_reward_history.pop(0)
+
+        running_reward = np.mean(episode_reward_history)
+
+        # Log metrics for this episode
+        agent.log_metrics(episode_count, episode_reward, running_reward, epsilon, loss)
+
+        episode_count += 1
+
+        # Print progress
+        if episode_count % 10 == 0:
+            print(
+                f"Episode {episode_count}: Reward = {episode_reward}, "
+                f"Running Reward = {running_reward:.2f}, "
+                f"Epsilon = {epsilon:.4f}"
             )
 
-            # Build the updated Q-values for the sampled future states
-            # Use the target model for stability
-            future_rewards = model_target.predict(state_next_sample)
-            # Q value = reward + discount factor * expected future reward
-            updated_q_values = rewards_sample + gamma * keras.ops.amax(
-                future_rewards, axis=1
-            )
-
-            # If final frame set the last value to -1
-            updated_q_values = updated_q_values * (1 - done_sample) - done_sample
-
-            # Create a mask so we only calculate loss on the updated Q-values
-            masks = keras.ops.one_hot(action_sample, num_actions)
-
-            with tf.GradientTape() as tape:
-                # Train the model on the states and updated Q-values
-                q_values = model(state_sample)
-
-                # Apply the masks to the Q-values to get the Q-value for action taken
-                q_action = keras.ops.sum(keras.ops.multiply(q_values, masks), axis=1)
-                # Calculate loss between new Q-value and old Q-value
-                loss = loss_function(updated_q_values, q_action)
-
-            # Backpropagation
-            grads = tape.gradient(loss, model.trainable_variables)
-            optimizer.apply_gradients(zip(grads, model.trainable_variables))
-
-        if frame_count % update_target_network == 0:
-            # update the the target network with new weights
-            model_target.set_weights(model.get_weights())
-            # Log details
-            template = "running reward: {:.2f} at episode {}, frame count {}"
-            print(template.format(running_reward, episode_count, frame_count))
-
-        # Limit the state and reward history
-        if len(rewards_history) > max_memory_length:
-            del rewards_history[:1]
-            del state_history[:1]
-            del state_next_history[:1]
-            del action_history[:1]
-            del done_history[:1]
-
-        if done:
+        # Stopping conditions
+        if running_reward > 40:
+            print(f"Solved at episode {episode_count}!")
             break
 
-    # Update running reward to check condition for solving
-    episode_reward_history.append(episode_reward)
-    if len(episode_reward_history) > 100:
-        del episode_reward_history[:1]
-    running_reward = np.mean(episode_reward_history)
+    # Save final metrics
+    agent.save_metrics()
 
-    episode_count += 1
+    return agent
 
-    if running_reward > 40:  # Condition to consider the task solved
-        print("Solved at episode {}!".format(episode_count))
-        break
 
-    if (
-        max_episodes > 0 and episode_count >= max_episodes
-    ):  # Maximum number of episodes reached
-        print("Stopped at episode {}!".format(episode_count))
-        break
+# Main execution
+if __name__ == "__main__":
+    trained_agent = train_dqn()
