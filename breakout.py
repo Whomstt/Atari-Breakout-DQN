@@ -6,7 +6,12 @@ import keras
 from keras import layers
 
 import gymnasium as gym
-from gymnasium.wrappers import AtariPreprocessing, FrameStackObservation
+from gymnasium.wrappers import (
+    AtariPreprocessing,
+    FrameStackObservation,
+    RecordVideo,
+    RecordEpisodeStatistics,
+)
 import numpy as np
 import tensorflow as tf
 import ale_py
@@ -23,15 +28,25 @@ epsilon_interval = (
 batch_size = 32  # Size of batch taken from replay buffer
 max_steps_per_episode = 10000
 max_episodes = 10  # Limit training episodes, will run until solved if smaller than 1
+video_folder = "recorded_episodes"
+
+os.makedirs(video_folder, exist_ok=True)
 
 gym.register_envs(ale_py)
 # Use the Atari environment
 # Specify the `render_mode` parameter to show the attempts of the agent in a pop up window.
-env = gym.make("ALE/Breakout-v5")  # , render_mode="human")
+env = gym.make("ALE/Breakout-v5", render_mode="rgb_array")  # , render_mode="human")
+env = RecordVideo(
+    env,
+    video_folder=video_folder,
+    episode_trigger=lambda x: x % 10 == 0 or x == max_episodes - 1,
+)
 # Environment preprocessing
 env = AtariPreprocessing(env, frame_skip=1)
 # Stack four frames
 env = FrameStackObservation(env, 4)
+
+# Seed the environment
 env.reset(seed=seed)
 
 num_actions = 4
