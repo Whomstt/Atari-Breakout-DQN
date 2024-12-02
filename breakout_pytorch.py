@@ -27,7 +27,7 @@ epsilon_max = 1.0
 epsilon_interval = epsilon_max - epsilon_min
 batch_size = 32
 max_steps_per_episode = 10000
-max_episodes = 10
+max_episodes = 2000
 video_folder = "recorded_episodes"
 
 os.makedirs(video_folder, exist_ok=True)
@@ -45,6 +45,7 @@ env = FrameStackObservation(env, 4)
 env.reset(seed=seed)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
 num_actions = 4
 input_dim = (4, 84, 84)
@@ -220,6 +221,8 @@ while True:
     running_reward = np.mean(episode_reward_history)
 
     episode_count += 1
+
+    print(f"Episode {episode_count} finished with reward {episode_reward}")
 
     # Termination conditions
     if running_reward > 40:
