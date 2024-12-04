@@ -50,11 +50,11 @@ class ReplayBuffer:
 def Deep_Q_Learning(
     env,
     replay_memory_size=1_000_000,
-    nb_epochs=30_000_000,
+    nb_epochs=100_000,
     update_frequency=4,
     batch_size=32,
     discount_factor=0.99,
-    replay_start_size=80_000,
+    replay_start_size=10_000,
     initial_exploration=1,
     final_exploration=0.01,
     exploration_steps=1_000_000,
@@ -107,19 +107,21 @@ def Deep_Q_Learning(
                 # Sample random minibatch of transitions (φj , aj , rj , φj +1 ) from D
                 batch = rb.sample(batch_size)
 
-                states, actions, rewards, next_states, dones = zip(*batch)
+                states, actions, rewards_batch, next_states, dones = zip(*batch)
 
                 states = torch.tensor(np.array(states), dtype=torch.float32).to(device)
                 next_states = torch.tensor(
                     np.array(next_states), dtype=torch.float32
                 ).to(device)
                 actions = torch.tensor(actions, dtype=torch.long).to(device)
-                rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
+                rewards_batch = torch.tensor(rewards_batch, dtype=torch.float32).to(
+                    device
+                )
                 dones = torch.tensor(dones, dtype=torch.float32).to(device)
 
                 with torch.no_grad():
                     max_q_value, _ = target_network(next_states).max(dim=1)
-                    y = rewards + discount_factor * max_q_value * (1 - dones)
+                    y = rewards_batch + discount_factor * max_q_value * (1 - dones)
 
                 current_q_value = (
                     q_network(states).gather(1, actions.unsqueeze(1)).squeeze()
@@ -140,23 +142,21 @@ def Deep_Q_Learning(
                     )
 
             epoch += 1
-            if (epoch % 50_000 == 0) and epoch > 0:
+            if (epoch % 10_000 == 0) and epoch > 0:
                 smoothed_rewards.append(np.mean(rewards))
                 rewards = []
-                plt.plot(smoothed_rewards)
-                plt.title("Average Reward on Breakout")
-                plt.xlabel("Training Epochs")
-                plt.ylabel("Average Reward per Episode")
-                plt.savefig("Imgs/average_reward_on_breakout.png")
-                plt.close()
-
             progress_bar.update(1)
         rewards.append(total_rewards)
+    plt.plot(smoothed_rewards)
+    plt.title("Average Reward on Breakout")
+    plt.xlabel("Training Epochs")
+    plt.ylabel("Average Reward per Episode")
+    plt.show()
 
 
 if __name__ == "__main__":
     gym.register_envs(ale_py)
-    env = gym.make("ALE/Breakout-v5", render_mode="human")
+    env = gym.make("ALE/Breakout-v5")
     env = AtariPreprocessing(env, frame_skip=1)
     env = FrameStackObservation(env, 4)
 
