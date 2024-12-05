@@ -1,247 +1,288 @@
 import os
-import gymnasium as gym
-from gymnasium.wrappers import AtariPreprocessing, FrameStackObservation, RecordVideo
+import random
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import ale_py
+import torch.nn.functional as F
+import gymnasium as gym
 import matplotlib.pyplot as plt
-from collections import deque
-import random
+from gymnasium.wrappers import RecordVideo, AtariPreprocessing, FrameStackObservation
+from typing import Tuple, List
+import logging
+import ale_py
 
-# Configuration parameters remain the same
-seed = 42
-gamma = 0.99
-epsilon = 1.0
-epsilon_min = 0.1
-epsilon_max = 1.0
-epsilon_interval = epsilon_max - epsilon_min
-batch_size = 32
-max_steps_per_episode = 10000
-max_episodes = 10000
+# Adjustable parameters
+NUM_EPISODES = 1000
+EPSILON_START = 1.0
+EPSILON_END = 0.1
+EPSILON_DECAY = 250000
+TARGET_UPDATE = 5
+BUFFER_CAPACITY = 100000
+BATCH_SIZE = 64
+GAMMA = 0.99
+LR = 1e-4
+INPUT_SHAPE = (4, 84, 84)
+VIDEO_FOLDER = "recorded_episodes"
+VIDEO_EPISODE_TRIGGER = 100
+MAX_STEPS_PER_EPISODE = 10000
+PRIORITY_ALPHA = 0.6
+PRIORITY_BETA_START = 0.4
+PRIORITY_BETA_FRAMES = 50000
 
-# Environment setup remains the same
-os.makedirs("recorded_episodes", exist_ok=True)
+# Environment setup
+os.makedirs(VIDEO_FOLDER, exist_ok=True)
 gym.register_envs(ale_py)
-env = gym.make(
-    "ALE/Breakout-v5",
-    render_mode="rgb_array",
-    obs_type="grayscale",
-    frameskip=1,
-    repeat_action_probability=0.25,
-)
+env = gym.make("ALE/Breakout-v5", render_mode="rgb_array")
 env = RecordVideo(
     env,
-    video_folder="recorded_episodes",
-    episode_trigger=lambda x: x % 1000 == 0,
+    video_folder=VIDEO_FOLDER,
+    episode_trigger=lambda x: x % VIDEO_EPISODE_TRIGGER == 0,
 )
-env = AtariPreprocessing(env, frame_skip=4, scale_obs=True)
-env = FrameStackObservation(env, stack_size=4)
+env = AtariPreprocessing(env, frame_skip=1)  # Env already using default frame_skip 4
+env = FrameStackObservation(env, 4)
 
-num_actions = 4
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Set up logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
 
-class ReplayBuffer:
-    def __init__(self, maxlen):
-        self.states = deque(maxlen=maxlen)
-        self.actions = deque(maxlen=maxlen)
-        self.rewards = deque(maxlen=maxlen)
-        self.next_states = deque(maxlen=maxlen)
-        self.dones = deque(maxlen=maxlen)
+class DuelingDQN(nn.Module):
+    def __init__(self, input_shape: Tuple[int, int, int], num_actions: int):
+        super(DuelingDQN, self).__init__()
+        self.conv1 = nn.Conv2d(input_shape[0], 32, kernel_size=8, stride=4)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
+        self.fc1 = nn.Linear(self.feature_size(input_shape), 512)
+        self.value_stream = nn.Linear(512, 1)
+        self.advantage_stream = nn.Linear(512, num_actions)
 
-    def add(self, state, action, reward, next_state, done):
-        self.states.append(state)
-        self.actions.append(action)
-        self.rewards.append(reward)
-        self.next_states.append(next_state)
-        self.dones.append(done)
-
-    def sample(self, batch_size):
-        indices = random.sample(range(len(self.states)), batch_size)
+    def feature_size(self, input_shape: Tuple[int, int, int]) -> int:
         return (
-            torch.FloatTensor(np.array([self.states[i] for i in indices])),
-            torch.LongTensor([self.actions[i] for i in indices]),
-            torch.FloatTensor([self.rewards[i] for i in indices]),
-            torch.FloatTensor(np.array([self.next_states[i] for i in indices])),
-            torch.FloatTensor([float(self.dones[i]) for i in indices]),
+            self.conv3(self.conv2(self.conv1(torch.zeros(1, *input_shape))))
+            .view(1, -1)
+            .size(1)
         )
 
-    def __len__(self):
-        return len(self.states)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        value = self.value_stream(x)
+        advantage = self.advantage_stream(x)
+        return value + advantage - advantage.mean()
 
 
-class QNetwork(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.network = nn.Sequential(
-            nn.Conv2d(4, 32, kernel_size=8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(3136, 512),
-            nn.ReLU(),
-            nn.Linear(512, num_actions),
-        )
+class PrioritizedReplayBuffer:
+    def __init__(self, capacity: int, alpha: float):
+        self.capacity = capacity
+        self.alpha = alpha
+        self.buffer = []
+        self.pos = 0
+        self.priorities = np.zeros((capacity,), dtype=np.float32)
 
-    def forward(self, x):
-        return self.network(x)
-
-
-# Create models and optimizer
-model = QNetwork().to(device)
-model_target = QNetwork().to(device)
-model_target.load_state_dict(model.state_dict())  # Initialize target network
-optimizer = optim.Adam(model.parameters(), lr=0.00025)
-loss_function = nn.SmoothL1Loss()  # Huber loss
-
-# Experience replay buffers remain the same
-action_history = []
-state_history = []
-state_next_history = []
-rewards_history = []
-done_history = []
-episode_reward_history = []
-running_reward = 0
-episode_count = 0
-frame_count = 0
-
-# Training parameters remain the same
-epsilon_random_frames = 50000
-epsilon_greedy_frames = 1000000.0
-max_memory_length = 100000
-update_after_actions = 4
-update_target_network = 10000
-
-# Start the training loop
-for episode_count in range(max_episodes):
-    observation, _ = env.reset()
-    state = np.array(observation)
-    episode_reward = 0
-
-    for timestep in range(1, max_steps_per_episode):
-        frame_count += 1
-
-        # Epsilon-greedy action selection
-        if frame_count < epsilon_random_frames or epsilon > np.random.rand(1)[0]:
-            action = np.random.choice(num_actions)
+    def push(
+        self,
+        state: np.ndarray,
+        action: int,
+        reward: float,
+        next_state: np.ndarray,
+        done: bool,
+    ):
+        max_prio = self.priorities.max() if self.buffer else 1.0
+        if len(self.buffer) < self.capacity:
+            self.buffer.append((state, action, reward, next_state, done))
         else:
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+            self.buffer[self.pos] = (state, action, reward, next_state, done)
+        self.priorities[self.pos] = max_prio
+        self.pos = (self.pos + 1) % self.capacity
+
+    def sample(self, batch_size: int, beta: float = 0.4) -> Tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+    ]:
+        if len(self.buffer) == self.capacity:
+            prios = self.priorities
+        else:
+            prios = self.priorities[: self.pos]
+        probs = prios**self.alpha
+        probs /= probs.sum()
+        indices = np.random.choice(len(self.buffer), batch_size, p=probs)
+        samples = [self.buffer[idx] for idx in indices]
+        total = len(self.buffer)
+        weights = (total * probs[indices]) ** (-beta)
+        weights /= weights.max()
+        weights = np.array(weights, dtype=np.float32)
+        batch = list(zip(*samples))
+        states = np.stack(batch[0])
+        actions = np.array(batch[1])
+        rewards = np.array(batch[2])
+        next_states = np.stack(batch[3])
+        dones = np.array(batch[4])
+        return states, actions, rewards, next_states, dones, indices, weights
+
+    def update_priorities(self, batch_indices: List[int], batch_priorities: np.ndarray):
+        for idx, prio in zip(batch_indices, batch_priorities):
+            self.priorities[idx] = prio
+
+    def __len__(self) -> int:
+        return len(self.buffer)
+
+
+class DDQNAgent:
+    def __init__(
+        self,
+        input_shape: Tuple[int, int, int],
+        num_actions: int,
+        buffer_capacity: int = BUFFER_CAPACITY,
+        batch_size: int = BATCH_SIZE,
+        gamma: float = GAMMA,
+        lr: float = LR,
+        alpha: float = PRIORITY_ALPHA,
+        beta_start: float = PRIORITY_BETA_START,
+        beta_frames: int = PRIORITY_BETA_FRAMES,
+    ):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.policy_net = DuelingDQN(input_shape, num_actions).to(self.device)
+        self.target_net = DuelingDQN(input_shape, num_actions).to(self.device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()
+        self.optimizer = torch.optim.Adam(self.policy_net.parameters(), lr=lr)
+        self.scheduler = torch.optim.lr_scheduler.StepLR(
+            self.optimizer, step_size=1000, gamma=0.99
+        )
+        self.memory = PrioritizedReplayBuffer(buffer_capacity, alpha)
+        self.batch_size = batch_size
+        self.gamma = gamma
+        self.num_actions = num_actions
+        self.steps_done = 0
+        self.beta_start = beta_start
+        self.beta_frames = beta_frames
+        self.best_avg_reward = -float("inf")
+
+    def select_action(self, state: np.ndarray, epsilon: float) -> int:
+        if random.random() > epsilon:
             with torch.no_grad():
-                action_probs = model(state_tensor)
-            action = torch.argmax(action_probs).item()
+                state = torch.tensor(
+                    state, device=self.device, dtype=torch.float32
+                ).unsqueeze(0)
+                return self.policy_net(state).max(1)[1].item()
+        else:
+            return random.randrange(self.num_actions)
 
-        epsilon -= epsilon_interval / epsilon_greedy_frames
-        epsilon = max(epsilon, epsilon_min)
+    def optimize_model(self):
+        if len(self.memory) < self.batch_size:
+            return
+        beta = (
+            self.beta_start
+            + self.steps_done * (1.0 - self.beta_start) / self.beta_frames
+        )
+        states, actions, rewards, next_states, dones, indices, weights = (
+            self.memory.sample(self.batch_size, beta)
+        )
+        states = torch.tensor(states, device=self.device, dtype=torch.float32)
+        actions = torch.tensor(actions, device=self.device, dtype=torch.long)
+        rewards = torch.tensor(rewards, device=self.device, dtype=torch.float32)
+        next_states = torch.tensor(next_states, device=self.device, dtype=torch.float32)
+        dones = torch.tensor(dones, device=self.device, dtype=torch.float32)
+        weights = torch.tensor(weights, device=self.device, dtype=torch.float32)
+        state_action_values = (
+            self.policy_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        )
+        next_state_actions = self.policy_net(next_states).max(1)[1]
+        next_state_values = (
+            self.target_net(next_states)
+            .gather(1, next_state_actions.unsqueeze(1))
+            .squeeze(1)
+        )
+        expected_state_action_values = rewards + (
+            self.gamma * next_state_values * (1 - dones)
+        )
+        loss = (state_action_values - expected_state_action_values.detach()).pow(
+            2
+        ) * weights
+        prios = loss + 1e-5
+        loss = loss.mean()
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1)
+        self.optimizer.step()
+        self.scheduler.step()
+        self.memory.update_priorities(indices, prios.data.cpu().numpy())
 
-        state_next, reward, done, _, _ = env.step(action)
-        state_next = np.array(state_next)
-        episode_reward += reward
+    def update_target_net(self):
+        self.target_net.load_state_dict(self.policy_net.state_dict())
 
-        # Save to replay buffer
-        action_history.append(action)
-        state_history.append(state)
-        state_next_history.append(state_next)
-        done_history.append(done)
-        rewards_history.append(reward)
-        state = state_next
+    def save_model(self, path: str):
+        torch.save(
+            {
+                "model_state_dict": self.policy_net.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+            },
+            path,
+        )
 
-        # Sample a batch from the experience replay buffer
-        if frame_count % update_after_actions == 0 and len(done_history) > batch_size:
-            indices = np.random.choice(range(len(done_history)), size=batch_size)
+    def load_model(self, path: str):
+        checkpoint = torch.load(path)
+        self.policy_net.load_state_dict(checkpoint["model_state_dict"])
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
-            state_sample = torch.FloatTensor(
-                np.array([state_history[i] for i in indices])
-            ).to(device)
-            state_next_sample = torch.FloatTensor(
-                np.array([state_next_history[i] for i in indices])
-            ).to(device)
-            rewards_sample = torch.FloatTensor(
-                [rewards_history[i] for i in indices]
-            ).to(device)
-            action_sample = torch.LongTensor([action_history[i] for i in indices]).to(
-                device
+
+def train_agent(agent: DDQNAgent, env, num_episodes: int):
+    total_rewards = []
+    running_avg_rewards = []
+    running_avg_window = 100
+
+    for episode in range(num_episodes):
+        state, _ = env.reset()
+        total_reward = 0
+        for t in range(MAX_STEPS_PER_EPISODE):
+            epsilon = EPSILON_END + (EPSILON_START - EPSILON_END) * np.exp(
+                -1.0 * agent.steps_done / EPSILON_DECAY
             )
-            done_sample = torch.FloatTensor(
-                [float(done_history[i]) for i in indices]
-            ).to(device)
+            action = agent.select_action(state, epsilon)
+            next_state, reward, done, _, _ = env.step(action)
+            agent.memory.push(state, action, reward, next_state, done)
+            state = next_state
+            total_reward += reward
+            agent.optimize_model()
+            agent.steps_done += 1
+            if done:
+                break
+        if episode % TARGET_UPDATE == 0:
+            agent.update_target_net()
+        total_rewards.append(total_reward)
+        running_avg_rewards.append(np.mean(total_rewards[-running_avg_window:]))
+        logging.info(
+            f"Episode {episode}, Total Reward: {total_reward}, Running Avg Reward: {running_avg_rewards[-1]:.3f}"
+        )
+        if running_avg_rewards[-1] > agent.best_avg_reward:
+            agent.best_avg_reward = running_avg_rewards[-1]
+            agent.save_model(f"best_ddqn_model.pth")
+        if episode % 100 == 0:
+            agent.save_model(f"ddqn_model_{episode}.pth")
 
-            # Double DQN: Use the model for action selection and the target model for Q-value calculation
-            with torch.no_grad():
-                next_action = model(state_next_sample).max(1)[
-                    1
-                ]  # Action selected by policy model
-                future_rewards = (
-                    model_target(state_next_sample)
-                    .gather(1, next_action.unsqueeze(1))
-                    .squeeze()
-                )  # Q-values from target model
-                target_q_values = rewards_sample + gamma * future_rewards * (
-                    1 - done_sample
-                )
+    return total_rewards, running_avg_rewards
 
-            current_q_values = (
-                model(state_sample).gather(1, action_sample.unsqueeze(1)).squeeze()
-            )
-            loss = loss_function(current_q_values, target_q_values)
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+num_actions = env.action_space.n
+agent = DDQNAgent(INPUT_SHAPE, num_actions)
 
-        # Update the target network periodically
-        if frame_count % update_target_network == 0:
-            model_target.load_state_dict(model.state_dict())
+total_rewards, running_avg_rewards = train_agent(agent, env, NUM_EPISODES)
 
-        # Remove old experiences from the replay buffer if it exceeds max memory length
-        if len(rewards_history) > max_memory_length:
-            del rewards_history[:1]
-            del state_history[:1]
-            del state_next_history[:1]
-            del action_history[:1]
-            del done_history[:1]
+env.close()
 
-        if done:
-            break
-
-    episode_reward_history.append(episode_reward)
-    running_reward = np.mean(episode_reward_history)
-
-    # Print relevant info after each episode
-    print(f"Episode {episode_count + 1}/{max_episodes}")
-    print(f"Episode Reward: {episode_reward:.2f}")
-    print(f"Running Reward: {running_reward:.2f}")
-    print(f"Epsilon: {epsilon:.2f}\n")
-
-    # Check if we solved the environment (running reward > 40)
-    if running_reward > 40:
-        print("Solved at episode {}!".format(episode_count + 1))
-        break
-
-# Plotting the results
-plt.figure(figsize=(12, 6))
-
-# Plot Episode Rewards
-plt.subplot(1, 2, 1)
-plt.plot(episode_reward_history)
-plt.title("Episode Rewards")
+# Plotting the total rewards and running average rewards
+plt.plot(total_rewards, label="Total Rewards")
+plt.plot(running_avg_rewards, label="Running Avg Rewards")
 plt.xlabel("Episode")
-plt.ylabel("Episode Reward")
-
-# Plot Running Reward (Total Running Average over all episodes)
-plt.subplot(1, 2, 2)
-plt.plot(
-    np.cumsum(episode_reward_history) / (np.arange(len(episode_reward_history)) + 1)
-)
-plt.title("Total Running Reward (All Episodes)")
-plt.xlabel("Episode")
-plt.ylabel("Running Reward")
-
-plt.tight_layout()
+plt.ylabel("Reward")
+plt.title("Total and Running Average Rewards per Episode")
+plt.legend()
 plt.show()
-
-print("Training finished.")
