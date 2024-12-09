@@ -17,8 +17,8 @@ import matplotlib.pyplot as plt
 # Configure our parameters
 seed = 42
 gamma = 0.99
-learning_rate = 0.00025
-max_episodes = 1000
+learning_rate = 0.0001
+max_episodes = 2000
 epsilon_max = 1
 epsilon_min = 0.01
 epsilon_decay = np.exp(np.log(epsilon_min / epsilon_max) / max_episodes)
@@ -47,21 +47,20 @@ env.reset(seed=seed)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
-
 # Define our model
 num_actions = 4
 input_dim = (4, 84, 84)
 output_dim = num_actions
 
 
-class DQN(nn.Module):
+class DuelingDQN(nn.Module):
     def __init__(self, input_dim, output_dim):
-        super(DQN, self).__init__()
+        super(DuelingDQN, self).__init__()
         self.input_dim = input_dim
         channels, _, _ = input_dim
 
-        # Three convolutional layers
-        self.l1 = nn.Sequential(
+        # Convolutional layers
+        self.feature_layer = nn.Sequential(
             nn.Conv2d(channels, 32, kernel_size=8, stride=4, padding=2),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),
@@ -70,34 +69,43 @@ class DQN(nn.Module):
             nn.ReLU(),
         )
 
-        # Fully connected layers
+        # Compute the output size of the convolutional layers
         conv_output_size = self.conv_output_dim()
-        lin1_output_size = 512
+        hidden_size = 512
 
-        # Two linear layers
-        self.l2 = nn.Sequential(
-            nn.Linear(conv_output_size, lin1_output_size),
+        # Separate streams for value and advantage
+        self.value_stream = nn.Sequential(
+            nn.Linear(conv_output_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(lin1_output_size, output_dim),
+            nn.Linear(hidden_size, 1),  # Outputs scalar state-value V(s)
         )
 
-    # Returns the output dimension of the convolutional layers
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(conv_output_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, output_dim),  # Outputs advantages A(s, a)
+        )
+
     def conv_output_dim(self):
         x = torch.zeros(1, *self.input_dim)
-        x = self.l1(x)
+        x = self.feature_layer(x)
         return int(np.prod(x.shape))
 
-    # Forward pass
     def forward(self, x):
-        x = self.l1(x)
+        x = self.feature_layer(x)
         x = x.view(x.shape[0], -1)
-        actions = self.l2(x)
 
-        return actions
+        # Compute value and advantages
+        value = self.value_stream(x)
+        advantage = self.advantage_stream(x)
+
+        # Combine streams to calculate Q-values
+        q_values = value + (advantage - advantage.mean(dim=1, keepdim=True))
+        return q_values
 
 
-model = DQN(input_dim, output_dim).to(device)
-model_target = DQN(input_dim, output_dim).to(device)
+model = DuelingDQN(input_dim, output_dim).to(device)
+model_target = DuelingDQN(input_dim, output_dim).to(device)
 model_target.load_state_dict(model.state_dict())
 
 optimizer = optim.Adam(model.parameters(), learning_rate)
