@@ -73,13 +73,14 @@ class DuelingDQN(nn.Module):
         conv_output_size = self.conv_output_dim()
         hidden_size = 512
 
-        # Separate streams for value and advantage
+        # Separate stream for values
         self.value_stream = nn.Sequential(
             nn.Linear(conv_output_size, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, 1),  # Outputs scalar state-value V(s)
         )
 
+        # Separate stream for advantages
         self.advantage_stream = nn.Sequential(
             nn.Linear(conv_output_size, hidden_size),
             nn.ReLU(),
